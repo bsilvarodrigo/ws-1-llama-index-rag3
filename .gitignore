@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.coverage
+
+# Environment
+.env
+.env.production
+
+# IDE
+.vscode/
+.idea/
+
+# Claude Code (personal settings)
+.claude/settings.local.json
+
+# Docker
+docker-compose.override.yml
+
+# Data
+*.parquet
+*.csv
+!docs/**/*.csv
+!infra/docs/*.csv

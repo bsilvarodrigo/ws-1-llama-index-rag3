@@ -1,0 +1,195 @@
+# DataOps Knowledge Hub — local infrastructure
+# Ledger (PostgreSQL) · Events (MongoDB) · Memory (Qdrant) · Brain (Neo4j) · Data Lake (SeaweedFS)
+# Credentials come from .env (copy from .env.example). Compose reads .env automatically for
+# ${VAR} interpolation; each service receives only the variables it needs (no env_file), so
+# secrets like OPENAI_API_KEY never reach the database containers, and Neo4j doesn't get the
+# app's NEO4J_URI/NEO4J_USER vars (its image treats every NEO4J_* var as a config setting).
+
+name: dataops-knowledge-hub
+
+services:
+  # ─── Ledger ────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./infra/scripts/init-databases.sql:/docker-entrypoint-initdb.d/init-databases.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - dataops-network
+    restart: unless-stopped
+
+  # ─── Events / Logs ─────────────────────────────────────────
+  mongo:
+    image: mongo:7
+    # No auth in dev (simplicity)
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - dataops-network
+    restart: unless-stopped
+
+  # ─── Memory (Vector DB) ────────────────────────────────────
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333" # HTTP
+      - "6334:6334" # gRPC
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      # The qdrant image ships without wget/curl, so call /healthz through bash's /dev/tcp
+      test:
+        - "CMD-SHELL"
+        - >-
+          bash -c 'exec 3<>/dev/tcp/127.0.0.1/6333 &&
+          printf "GET /healthz HTTP/1.0\r\nHost: localhost\r\n\r\n" >&3 &&
+          grep -q "healthz check passed" <&3'
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - dataops-network
+    restart: unless-stopped
+
+  # ─── Brain (Graph DB) ──────────────────────────────────────
+  neo4j:
+    image: neo4j:5-community
+    environment:
+      NEO4J_AUTH: ${NEO4J_USER}/${NEO4J_PASSWORD}
+      NEO4J_PLUGINS: '["apoc"]'
+    ports:
+      - "7474:7474" # Browser UI
+      - "7687:7687" # Bolt
+    volumes:
+      - neo4j_data:/data
+    healthcheck:
+      # Credentials interpolated by Compose from .env (the container itself only has NEO4J_AUTH)
+      test: ["CMD-SHELL", "cypher-shell -u ${NEO4J_USER} -p ${NEO4J_PASSWORD} 'RETURN 1' || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+    networks:
+      - dataops-network
+    restart: unless-stopped
+
+  # ─── Data Lake (S3-compatible) ─────────────────────────────
+  seaweedfs:
+    image: chrislusf/seaweedfs:latest
+    # -ip makes the master advertise a name other containers can resolve
+    command: server -s3 -dir=/data -ip=seaweedfs -ip.bind=0.0.0.0
+    ports:
+      - "8333:8333" # S3 API
+      - "9333:9333" # Master
+    volumes:
+      - seaweedfs_data:/data
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9333/cluster/status"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - dataops-network
+    restart: unless-stopped
+
+  # ─── One-shot init jobs (exit 0 when done; safe to re-run) ─
+  # Two services because no single image ships both cypher-shell and the AWS CLI.
+  # Service names are relied upon by docker-compose.production.yml (P14).
+  init-neo4j:
+    image: neo4j:5-community # only for cypher-shell; entrypoint override skips starting Neo4j
+    entrypoint: ["bash", "/scripts/seed-neo4j.sh"]
+    environment:
+      NEO4J_USER: ${NEO4J_USER}
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD}
+    volumes:
+      - ./infra/scripts:/scripts:ro
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    networks:
+      - dataops-network
+    restart: "no"
+
+  init-seaweedfs:
+    image: amazon/aws-cli:latest
+    entrypoint: ["bash", "/scripts/init-seaweedfs.sh"]
+    environment:
+      SEAWEEDFS_BUCKET: ${SEAWEEDFS_BUCKET}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_DEFAULT_REGION: us-east-1 # required by the CLI; SeaweedFS ignores it
+    volumes:
+      - ./infra/scripts:/scripts:ro
+      - ./infra/docs:/docs:ro
+    depends_on:
+      seaweedfs:
+        condition: service_healthy
+    networks:
+      - dataops-network
+    restart: "no"
+
+  # ─── Data Generator (simulated live operation) ─────────────
+  data-generator:
+    build:
+      context: ./generator
+      dockerfile: Dockerfile
+    environment:
+      # Inside the Docker network, reach services by name (.env uses localhost for host-side tools)
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      MONGO_HOST: mongo
+      MONGO_PORT: 27017
+      MONGO_DB: ${MONGO_DB}
+      SEAWEEDFS_HOST: seaweedfs
+      SEAWEEDFS_PORT: 8333
+      SEAWEEDFS_BUCKET: ${SEAWEEDFS_BUCKET}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_DEFAULT_REGION: us-east-1
+      GENERATOR_INTERVAL_SECONDS: ${GENERATOR_INTERVAL_SECONDS:-30}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+      seaweedfs:
+        condition: service_healthy
+      init-seaweedfs: # reports go into the bucket this job creates
+        condition: service_completed_successfully
+    networks:
+      - dataops-network
+    restart: unless-stopped
+
+networks:
+  dataops-network:
+    driver: bridge
+
+volumes:
+  pg_data:
+  mongo_data:
+  qdrant_data:
+  neo4j_data:
+  seaweedfs_data:
